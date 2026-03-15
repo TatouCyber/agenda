@@ -10,11 +10,19 @@ Usage :
 - --output : chemin du fichier .ics à créer (ou rien pour envoyer sur la sortie standard).
 """
 
-import argparse, datetime as _dt, html, re, sys
+import argparse
+import datetime as _dt
+import hashlib
+import html
+import os
+import re
+import sys
 from typing import Iterable, List, Optional
+
 import requests
 from bs4 import BeautifulSoup
-import hashlib
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 MONTHS = {
     "Janvier": 1, "Février": 2, "Fevrier": 2, "Mars": 3, "Avril": 4, "Mai": 5,
@@ -28,21 +36,41 @@ RE_TIME_VALUE = re.compile(r"^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$")
 RE_LOCATION = re.compile(r"^Lieu:\s*(.*)")
 RE_SUMMARY = re.compile(r"^Résumé:\s*(.*)")
 
+def build_session() -> requests.Session:
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
 def fetch_print_view(cal_id: str, date: str) -> str:
     url = f"https://agendas.insa-rouen.fr/print.php?cpath=&getdate={date}&cal[]={cal_id}"
     headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/118.0.0.0 Safari/537.36"),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/118.0.0.0 Safari/537.36"
+        ),
         "Referer": "https://agendas.insa-rouen.fr/",
     }
-    resp = requests.get(url, headers=headers)
+
+    session = build_session()
+    resp = session.get(url, headers=headers, timeout=(15, 45))
     resp.raise_for_status()
-    # The agenda endpoint now serves UTF-8; keep requests auto-detection.
+
     if resp.encoding is None:
         resp.encoding = resp.apparent_encoding
     return resp.text
-
 def normalize(text: str) -> str:
     return " ".join(html.unescape(text).split())
 
@@ -155,16 +183,31 @@ def main():
     p.add_argument("--date", required=True)
     p.add_argument("--output")
     args = p.parse_args()
+
     week_start = _dt.datetime.strptime(args.date, "%Y%m%d").date()
-    html = fetch_print_view(args.cal, args.date)
-    events = parse_events(html, week_start)
-    ical = to_ical(events, args.cal)
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(ical)
-        print(f"Wrote {len(events)} events to {args.output}")
-    else:
-        print(ical)
+
+    try:
+        html = fetch_print_view(args.cal, args.date)
+        events = parse_events(html, week_start)
+        ical = to_ical(events, args.cal)
+
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(ical)
+            print(f"Wrote {len(events)} events to {args.output}")
+        else:
+            print(ical)
+
+    except requests.exceptions.RequestException as e:
+        if args.output and os.path.exists(args.output):
+            print(
+                f"Warning: impossible de joindre le site INSA ({e}). "
+                f"On conserve le fichier existant : {args.output}",
+                file=sys.stderr,
+            )
+            return
+
+        raise
 
 if __name__ == "__main__":
     main()
